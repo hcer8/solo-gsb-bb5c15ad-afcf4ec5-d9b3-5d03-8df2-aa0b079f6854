@@ -55,6 +55,12 @@
   设置/查询配额，查询返回 quota/used/reserved/available，降低配额不得小于 used+reserved；
   POST /sessions/{id}/cancel 仅允许 active 会话取消，原子释放预留并使全部在途租约
   （含验收令牌）失效，重复取消幂等，已 finalized 不可取消
+
+事务边界：所有状态变更经 app.db.locked_transaction（调用方持有 DB_LOCK）走显式
+BEGIN IMMEDIATE…COMMIT/ROLLBACK（连接为 autocommit 模式，不依赖隐式事务）。
+校验失败（4xx）与执行异常（含 sqlite3 错误）一律回滚本次写入，不会遗留打开的事务
+被后续请求意外提交；预留到期的惰性取消作为独立事务在请求自身事务之前完整提交，
+即使请求最终返回 409，取消与上传/验收租约清除也已落库。
 """
 from __future__ import annotations
 
@@ -69,10 +75,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .db import DB_LOCK, get_conn, init_db
+from .db import DB_LOCK, get_conn, init_db, locked_transaction
 from .schemas import (
     MERKLE_DIGEST_ALGORITHM,
     BatchLeaseItem,
@@ -184,6 +190,25 @@ app = FastAPI(
 )
 
 
+class ConflictError(HTTPException):
+    """409 业务冲突：与 HTTPException(409) 等价，额外支持在响应体中附带字段。
+
+    作为普通异常抛出意味着它可以穿透事务边界：locked_transaction 捕获到后先
+    ROLLBACK 本次写入，再由下面的异常处理器渲染为 409 JSONResponse，保证
+    “返回 4xx 时不遗留任何本次写入的事务”。
+    """
+
+    def __init__(self, message: str, **extra):
+        super().__init__(status_code=409, detail=message)
+        self.extra = extra
+
+
+@app.exception_handler(ConflictError)
+async def conflict_error_handler(_: Request, exc: ConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409, content={"detail": exc.detail, **exc.extra})
+
+
 # ---------------------------------------------------------------- 工具函数
 
 def get_session_or_404(session_id: str):
@@ -258,12 +283,19 @@ def tenant_active_session_count(tenant_id: str, now_iso: str) -> int:
 
 
 def expire_session_if_due(session, now: datetime):
-    """临界区内调用：active 会话预留到期时原子标记为 cancelled 并清除在途租约，
-    返回标记后重新读取的会话行；未到期或已终结则原样返回。与取消同一套清理动作，
-    保证到期后任何租约令牌立即失效。"""
+    """临界区内、且当前不存在请求自身的打开事务时调用：active 会话预留到期时
+    原子标记为 cancelled 并清除在途租约，返回标记后重新读取的会话行；未到期或
+    已终结则原样返回。与取消同一套清理动作，保证到期后任何租约令牌立即失效。
+
+    惰性取消必须作为一笔**独立、完整**的事务立即提交——即使随后的请求校验失败
+    并以 4xx 返回，取消结果（含上传租约与验收租约的清除）也不得被回滚或泄漏到
+    后续请求的事务里。因此调用顺序固定为：持有 DB_LOCK 且无打开事务 →
+    本函数（独立提交）→ 再开启该请求自己的写事务。
+    """
     if not reservation_expired(session, now):
         return session
-    _cancel_session_locked(session["id"], now)
+    with locked_transaction():
+        _cancel_session_locked(session["id"], now)
     return get_conn().execute(
         "SELECT * FROM sessions WHERE id = ?", (session["id"],)
     ).fetchone()
@@ -488,8 +520,9 @@ def claimable_chunks(session_id: str, now: datetime) -> tuple[list[int], int]:
     return ready, blocked
 
 
-def conflict(message: str, **extra) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": message, **extra})
+def conflict(message: str, **extra):
+    """抛出带附加字段的 409：事务边界会先回滚本次写入，再渲染为 409 响应。"""
+    raise ConflictError(message, **extra)
 
 
 def dispatch_session_state(session_id: str, now: datetime):
@@ -567,15 +600,16 @@ def create_session(req: CreateSessionRequest):
         ttl = min(req.reservation_ttl_seconds, MAX_RESERVATION_TTL_SECONDS)
     reservation_expires_at = now + timedelta(seconds=ttl)
     with DB_LOCK:
-        conn = get_conn()
         tenant = get_tenant_or_404(req.tenant_id)
         # 硬配额校验与预留写入在同一写事务：并发创建经 DB_LOCK 串行化，
-        # 每个请求都以提交后的最新聚合值判定，不可能超额预留
+        # 每个请求都以提交后的最新聚合值判定，不可能超额预留。
+        # 校验在事务外先做（只读），通过后 INSERT 与提交构成单一事务边界；
+        # 404/409 不开启任何事务，后续请求不可能提交到半成品会话行。
         used = tenant_used_bytes(req.tenant_id)
         reserved = tenant_reserved_bytes(req.tenant_id, now_iso)
         available = tenant["quota_bytes"] - used - reserved
         if req.declared_bytes > available:
-            return conflict(
+            conflict(
                 "tenant quota exceeded",
                 quota_bytes=tenant["quota_bytes"],
                 used_bytes=used,
@@ -583,27 +617,27 @@ def create_session(req: CreateSessionRequest):
                 requested_bytes=req.declared_bytes,
                 available_bytes=max(0, available),
             )
-        conn.execute(
-            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
-            " max_active_leases, base_retry_seconds, max_retry_seconds,"
-            " verification_required, tenant_id, declared_bytes, reservation_expires_at,"
-            " created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
-             req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
-             1 if req.verification_required else 0,
-             req.tenant_id, req.declared_bytes, reservation_expires_at.isoformat(),
-             now_iso),
-        )
-        conn.executemany(
-            "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
-            [(session_id, i) for i in range(req.total_chunks)],
-        )
-        conn.executemany(
-            "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on) VALUES (?, ?, ?)",
-            [(session_id, idx, dep) for idx, dep_list in deps.items() for dep in dep_list],
-        )
-        conn.commit()
+        with locked_transaction() as conn:
+            conn.execute(
+                "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
+                " max_active_leases, base_retry_seconds, max_retry_seconds,"
+                " verification_required, tenant_id, declared_bytes, reservation_expires_at,"
+                " created_at)"
+                " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
+                 req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
+                 1 if req.verification_required else 0,
+                 req.tenant_id, req.declared_bytes, reservation_expires_at.isoformat(),
+                 now_iso),
+            )
+            conn.executemany(
+                "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
+                [(session_id, i) for i in range(req.total_chunks)],
+            )
+            conn.executemany(
+                "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on) VALUES (?, ?, ?)",
+                [(session_id, idx, dep) for idx, dep_list in deps.items() for dep in dep_list],
+            )
     return SessionResponse(
         id=session_id,
         total_chunks=req.total_chunks,
@@ -815,14 +849,16 @@ def fork_session(session_id: str, req: ForkSessionRequest):
                 ).model_dump(mode="json"),
             )
 
-        # 预留到期的 active 会话在此惰性转为 cancelled；已终结会话均不可再分支
+        # 预留到期的 active 会话在此惰性转为 cancelled（独立事务立即提交，
+        # 即使随后 revision/复用校验返回 409，取消与租约清除也已完整落库）；
+        # 已终结会话均不可再分支
         session = expire_session_if_due(session, now)
         if session["status"] == SESSION_STATUS_FINALIZED:
             raise HTTPException(status_code=409, detail="session already finalized")
         if session["status"] == SESSION_STATUS_CANCELLED:
             raise HTTPException(status_code=409, detail="session is cancelled")
         if session["revision"] != req.expected_revision:
-            return conflict(
+            conflict(
                 "revision mismatch",
                 expected_revision=req.expected_revision,
                 current_revision=session["revision"],
@@ -839,7 +875,7 @@ def fork_session(session_id: str, req: ForkSessionRequest):
             if idx not in by_index or by_index[idx]["status"] != "completed"
         )
         if not_completed:
-            return conflict(
+            conflict(
                 "reuse_chunks must reference completed chunks only",
                 not_completed_chunks=not_completed,
             )
@@ -847,7 +883,7 @@ def fork_session(session_id: str, req: ForkSessionRequest):
         deps = load_dependencies(session_id)
         missing_prerequisites = missing_transitive_prerequisites(deps, reuse_set)
         if missing_prerequisites:
-            return conflict(
+            conflict(
                 "reuse_chunks must include all transitive prerequisites",
                 missing_prerequisites=missing_prerequisites,
             )
@@ -861,7 +897,7 @@ def fork_session(session_id: str, req: ForkSessionRequest):
         reserved = tenant_reserved_bytes(session["tenant_id"], now_iso)
         available = tenant["quota_bytes"] - used - reserved
         if declared_bytes > available:
-            return conflict(
+            conflict(
                 "tenant quota exceeded",
                 quota_bytes=tenant["quota_bytes"],
                 used_bytes=used,
@@ -872,53 +908,53 @@ def fork_session(session_id: str, req: ForkSessionRequest):
         reservation_expires_at = now + timedelta(
             seconds=DEFAULT_RESERVATION_TTL_SECONDS)
 
-        # 全部校验先于写入：以下任一失败都不会发生，整个复制在同一事务/临界区内完成
+        # 全部校验先于任何 fork 写入：以下整段为单一事务，要么完整复制要么整体回滚
         new_id = uuid.uuid4().hex
-        conn.execute(
-            "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
-            " max_active_leases, base_retry_seconds, max_retry_seconds, revision,"
-            " source_session_id, verification_required, tenant_id, declared_bytes,"
-            " reservation_expires_at, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
-            (new_id, session["total_chunks"], session["file_digest"],
-             session["digest_algorithm"], session["max_active_leases"],
-             session["base_retry_seconds"], session["max_retry_seconds"],
-             session_id, session["verification_required"], session["tenant_id"],
-             declared_bytes, reservation_expires_at.isoformat(), now_iso),
-        )
-        # 复用分片：复制摘要与完成时间为 completed；其余默认 pending。
-        # 不复制 lease_token / lease_expires_at / backoff_until / failure_count
-        reused_rows = [
-            (new_id, idx, by_index[idx]["chunk_digest"], by_index[idx]["completed_at"])
-            for idx in reuse
-        ]
-        pending_rows = [
-            (new_id, idx)
-            for idx in range(session["total_chunks"])
-            if idx not in reuse_set
-        ]
-        conn.executemany(
-            "INSERT INTO chunks (session_id, chunk_index, status, chunk_digest,"
-            " completed_at) VALUES (?, ?, 'completed', ?, ?)",
-            reused_rows,
-        )
-        conn.executemany(
-            "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
-            pending_rows,
-        )
-        # 完整复制依赖图：新会话的调度约束与源会话一致
-        conn.execute(
-            "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on)"
-            " SELECT ?, chunk_index, depends_on FROM chunk_dependencies WHERE session_id = ?",
-            (new_id, session_id),
-        )
-        conn.execute(
-            "INSERT INTO fork_requests (source_session_id, request_id, new_session_id,"
-            " expected_revision, reuse_chunks, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, req.request_id, new_id, req.expected_revision,
-             json.dumps(reuse), now.isoformat()),
-        )
-        conn.commit()
+        with locked_transaction() as conn:
+            conn.execute(
+                "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
+                " max_active_leases, base_retry_seconds, max_retry_seconds, revision,"
+                " source_session_id, verification_required, tenant_id, declared_bytes,"
+                " reservation_expires_at, created_at)"
+                " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+                (new_id, session["total_chunks"], session["file_digest"],
+                 session["digest_algorithm"], session["max_active_leases"],
+                 session["base_retry_seconds"], session["max_retry_seconds"],
+                 session_id, session["verification_required"], session["tenant_id"],
+                 declared_bytes, reservation_expires_at.isoformat(), now_iso),
+            )
+            # 复用分片：复制摘要与完成时间为 completed；其余默认 pending。
+            # 不复制 lease_token / lease_expires_at / backoff_until / failure_count
+            reused_rows = [
+                (new_id, idx, by_index[idx]["chunk_digest"], by_index[idx]["completed_at"])
+                for idx in reuse
+            ]
+            pending_rows = [
+                (new_id, idx)
+                for idx in range(session["total_chunks"])
+                if idx not in reuse_set
+            ]
+            conn.executemany(
+                "INSERT INTO chunks (session_id, chunk_index, status, chunk_digest,"
+                " completed_at) VALUES (?, ?, 'completed', ?, ?)",
+                reused_rows,
+            )
+            conn.executemany(
+                "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
+                pending_rows,
+            )
+            # 完整复制依赖图：新会话的调度约束与源会话一致
+            conn.execute(
+                "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on)"
+                " SELECT ?, chunk_index, depends_on FROM chunk_dependencies WHERE session_id = ?",
+                (new_id, session_id),
+            )
+            conn.execute(
+                "INSERT INTO fork_requests (source_session_id, request_id, new_session_id,"
+                " expected_revision, reuse_chunks, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, req.request_id, new_id, req.expected_revision,
+                 json.dumps(reuse), now.isoformat()),
+            )
 
     return build_fork_response(
         new_id=new_id,
@@ -1010,7 +1046,8 @@ def claim_lease(
     now = utcnow()
     with DB_LOCK:
         session = get_session_or_404(session_id)
-        # 预留到期的 active 会话惰性转为 cancelled，随后与显式取消一致拒绝一切写入
+        # 预留到期的 active 会话惰性转为 cancelled（独立事务立即提交），
+        # 随后与显式取消一致拒绝一切写入
         session = expire_session_if_due(session, now)
         if session["status"] == SESSION_STATUS_FINALIZED:
             raise HTTPException(status_code=409, detail="session already finalized")
@@ -1027,20 +1064,20 @@ def claim_lease(
                 detail="chunk is awaiting verification and cannot be leased again",
             )
         if lease_valid(chunk, now):
-            return conflict(
+            conflict(
                 "chunk lease already held",
                 lease_expires_at=chunk["lease_expires_at"],
             )
         if backoff_active(chunk, now):
             # 失败退避冷却中：单片领取同样拒绝，直至 retry_after
-            return conflict(
+            conflict(
                 "chunk in failure backoff",
                 failure_count=chunk["failure_count"] or 0,
                 retry_after=chunk["backoff_until"],
             )
         missing_deps = incomplete_dependencies(session_id, chunk_index)
         if missing_deps:
-            return conflict(
+            conflict(
                 "chunk dependencies not completed",
                 missing_dependencies=missing_deps,
             )
@@ -1048,7 +1085,7 @@ def claim_lease(
         max_active = session["max_active_leases"]
         active = count_active_leases(session_id, now)
         if max_active is not None and active >= max_active:
-            return conflict(
+            conflict(
                 "session max active leases reached",
                 max_active_leases=max_active,
                 active_leases=active,
@@ -1056,12 +1093,14 @@ def claim_lease(
 
         token = secrets.token_urlsafe(32)
         expires_at = now + timedelta(seconds=ttl)
-        get_conn().execute(
-            "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
-            " WHERE session_id = ? AND chunk_index = ?",
-            (token, expires_at.isoformat(), session_id, chunk_index),
-        )
-        get_conn().commit()
+        # 资格校验全部为只读（无打开事务）；租约写入单独成事务，409/异常一律回滚，
+        # 不可能把半条 UPDATE 遗留给后续请求提交
+        with locked_transaction() as conn:
+            conn.execute(
+                "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (token, expires_at.isoformat(), session_id, chunk_index),
+            )
 
     return LeaseResponse(
         session_id=session_id,
@@ -1104,22 +1143,22 @@ def claim_leases_batch(session_id: str, req: BatchLeaseRequest):
         granted: list[BatchLeaseItem] = []
         if quota > 0:
             expires_at = now + timedelta(seconds=ttl)
-            conn = get_conn()
-            for chunk_index in ready[:quota]:
-                token = secrets.token_urlsafe(32)
-                conn.execute(
-                    "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
-                    " WHERE session_id = ? AND chunk_index = ?",
-                    (token, expires_at.isoformat(), session_id, chunk_index),
-                )
-                granted.append(
-                    BatchLeaseItem(
-                        chunk_index=chunk_index,
-                        lease_token=token,
-                        expires_at=expires_at,
+            # 批量发放为一笔事务：循环中途任何异常都整体回滚，不会只发出前几条租约
+            with locked_transaction() as conn:
+                for chunk_index in ready[:quota]:
+                    token = secrets.token_urlsafe(32)
+                    conn.execute(
+                        "UPDATE chunks SET status = 'leased', lease_token = ?, lease_expires_at = ?"
+                        " WHERE session_id = ? AND chunk_index = ?",
+                        (token, expires_at.isoformat(), session_id, chunk_index),
                     )
-                )
-            conn.commit()
+                    granted.append(
+                        BatchLeaseItem(
+                            chunk_index=chunk_index,
+                            lease_token=token,
+                            expires_at=expires_at,
+                        )
+                    )
 
         active_after = active + len(granted)
         # 无可领取项时，调用方可据 next_expiry 等待：有效租约过期或退避冷却结束，取更早者
@@ -1218,10 +1257,12 @@ def dispatch_lease(req: DispatchLeaseRequest):
                 ))
                 continue
 
-            # 预留到期的 active 会话在本临界区内惰性转为 cancelled；
+            # 预留到期的 active 会话在本临界区内惰性转为 cancelled：取消清理作为
+            # 独立事务立即提交，即使本次扫描最终无发放（响应 200 且 granted=null），
+            # 取消与上传/验收租约清除也已完整持久化，不与游标更新共事务。
             # 取消与到期都是终态，不携带 next_retry_at（不会自行恢复）
             if reservation_expired(session, now):
-                _cancel_session_locked(sid, now)
+                expire_session_if_due(session, now)
                 unavailable.append(DispatchUnavailableSession(
                     session_id=sid,
                     reason=DISPATCH_REASON_RESERVATION_EXPIRED,
@@ -1257,25 +1298,27 @@ def dispatch_lease(req: DispatchLeaseRequest):
                         retry_times.append(wakeup)
                     continue
 
-                # 命中：领取该会话内序号最低的可领取分片；资格计算与写入在同一临界区
+                # 命中：领取该会话内序号最低的可领取分片；资格计算与写入在同一临界区。
+                # 租约 UPDATE 与游标 UPSERT 构成一笔事务：任一失败整体回滚，
+                # 不会出现“分片已发放但游标未推进”或反向的半成品。
                 chunk_index = ready[0]
                 token = secrets.token_urlsafe(32)
                 expires_at = now + timedelta(seconds=ttl)
-                conn.execute(
-                    "UPDATE chunks SET status = 'leased', lease_token = ?,"
-                    " lease_expires_at = ? WHERE session_id = ? AND chunk_index = ?",
-                    (token, expires_at.isoformat(), sid, chunk_index),
-                )
-                # 成功后才推进游标（UPSERT）：无可发放项的请求不会执行到这里
-                conn.execute(
-                    "INSERT INTO dispatch_cursors (queue_key, last_session_id, updated_at)"
-                    " VALUES (?, ?, ?)"
-                    " ON CONFLICT(queue_key) DO UPDATE SET"
-                    " last_session_id = excluded.last_session_id,"
-                    " updated_at = excluded.updated_at",
-                    (req.queue_key, sid, now.isoformat()),
-                )
-                conn.commit()
+                with locked_transaction() as write_conn:
+                    write_conn.execute(
+                        "UPDATE chunks SET status = 'leased', lease_token = ?,"
+                        " lease_expires_at = ? WHERE session_id = ? AND chunk_index = ?",
+                        (token, expires_at.isoformat(), sid, chunk_index),
+                    )
+                    # 成功后才推进游标（UPSERT）：无可发放项的请求不会执行到这里
+                    write_conn.execute(
+                        "INSERT INTO dispatch_cursors (queue_key, last_session_id, updated_at)"
+                        " VALUES (?, ?, ?)"
+                        " ON CONFLICT(queue_key) DO UPDATE SET"
+                        " last_session_id = excluded.last_session_id,"
+                        " updated_at = excluded.updated_at",
+                        (req.queue_key, sid, now.isoformat()),
+                    )
 
                 return DispatchLeaseResponse(
                     queue_key=req.queue_key,
@@ -1346,8 +1389,8 @@ def dispatch_lease(req: DispatchLeaseRequest):
             unavailable.append(entry)
 
         # 全部候选均不可发放：本路径无成功发放，游标保持不变；
-        # 若扫描中惰性取消了到期会话，需要提交该状态变更
-        conn.commit()
+        # 扫描中惰性取消的到期会话已由 expire_session_if_due 独立提交，
+        # 此处无任何待提交写入（无打开事务，不会泄漏给后续请求）。
 
     return DispatchLeaseResponse(
         queue_key=req.queue_key,
@@ -1418,13 +1461,15 @@ def complete_chunk(session_id: str, chunk_index: int, req: CompleteRequest):
             if session["verification_required"]
             else "completed"
         )
-        get_conn().execute(
-            "UPDATE chunks SET status = ?, chunk_digest = ?, completed_at = ?,"
-            " backoff_until = NULL"
-            " WHERE session_id = ? AND chunk_index = ?",
-            (new_status, req.chunk_digest, now.isoformat(), session_id, chunk_index),
-        )
-        get_conn().commit()
+        # 校验全部只读且先于写入：UPDATE 独立成事务，409/数据库异常都会回滚，
+        # 不会留下“状态已改但摘要未写”之类的半成品
+        with locked_transaction() as write_conn:
+            write_conn.execute(
+                "UPDATE chunks SET status = ?, chunk_digest = ?, completed_at = ?,"
+                " backoff_until = NULL"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (new_status, req.chunk_digest, now.isoformat(), session_id, chunk_index),
+            )
 
     return CompleteResponse(
         session_id=session_id,
@@ -1474,14 +1519,15 @@ def fail_chunk(session_id: str, chunk_index: int, req: FailRequest):
         failure_count = (chunk["failure_count"] or 0) + 1
         delay = backoff_delay(session, failure_count)
         retry_after = now + timedelta(seconds=delay)
-        # 原子清除租约 + 递增失败次数 + 设置冷却截止；failure_count 永不因本接口清零
-        get_conn().execute(
-            "UPDATE chunks SET status = 'pending', lease_token = NULL,"
-            " lease_expires_at = NULL, failure_count = ?, backoff_until = ?"
-            " WHERE session_id = ? AND chunk_index = ?",
-            (failure_count, retry_after.isoformat(), session_id, chunk_index),
-        )
-        get_conn().commit()
+        # 原子清除租约 + 递增失败次数 + 设置冷却截止；failure_count 永不因本接口清零。
+        # 单条 UPDATE 也走显式事务边界：失败时回滚，连接不会停留在异常事务中。
+        with locked_transaction() as write_conn:
+            write_conn.execute(
+                "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+                " lease_expires_at = NULL, failure_count = ?, backoff_until = ?"
+                " WHERE session_id = ? AND chunk_index = ?",
+                (failure_count, retry_after.isoformat(), session_id, chunk_index),
+            )
 
     return FailResponse(
         session_id=session_id,
@@ -1531,25 +1577,25 @@ def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
             raise HTTPException(status_code=409, detail="digest mismatch")
 
         affected = collect_reopen_affected(session_id, chunk_index)
-        conn = get_conn()
-        # failure_count 不在重置之列：累计失败次数跨回退保留
-        conn.executemany(
-            "UPDATE chunks SET status = 'pending', lease_token = NULL,"
-            " lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
-            " backoff_until = NULL"
-            " WHERE session_id = ? AND chunk_index = ?",
-            [(session_id, idx) for idx, _ in affected],
-        )
-        # 受影响分片中若存在残留的待验收租约行（理论上仅可能是历史脏数据），一并清除
-        conn.executemany(
-            "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
-            [(session_id, idx) for idx, _ in affected],
-        )
-        conn.execute(
-            "UPDATE sessions SET revision = revision + 1 WHERE id = ?",
-            (session_id,),
-        )
-        conn.commit()
+        # failure_count 不在重置之列：累计失败次数跨回退保留。
+        # 全部重置与 revision 递增为一笔事务：任一 SQL 失败整体回滚，绝不部分回退
+        with locked_transaction() as write_conn:
+            write_conn.executemany(
+                "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+                " lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
+                " backoff_until = NULL"
+                " WHERE session_id = ? AND chunk_index = ?",
+                [(session_id, idx) for idx, _ in affected],
+            )
+            # 受影响分片中若存在残留的待验收租约行（理论上仅可能是历史脏数据），一并清除
+            write_conn.executemany(
+                "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
+                [(session_id, idx) for idx, _ in affected],
+            )
+            write_conn.execute(
+                "UPDATE sessions SET revision = revision + 1 WHERE id = ?",
+                (session_id,),
+            )
 
     return ReopenResponse(
         session_id=session_id,
@@ -1588,27 +1634,27 @@ def finalize_session(session_id: str):
 
         missing = [r["chunk_index"] for r in rows if r["status"] != "completed"]
         if missing:
-            return conflict("upload incomplete", missing_chunks=missing)
+            conflict("upload incomplete", missing_chunks=missing)
 
         if session["digest_algorithm"] == MERKLE_DIGEST_ALGORITHM:
             # 按分片序号升序读取摘要构建 Merkle 树，与 file_digest 常量时间比较；
             # 不匹配时不做任何写入，会话保持 active，可纠错后重试
             computed = merkle_root_sha256([r["chunk_digest"] for r in rows])
             if not hmac.compare_digest(computed, session["file_digest"]):
-                return conflict("file digest mismatch", computed_digest=computed)
+                conflict("file digest mismatch", computed_digest=computed)
 
         finalized_at = parse_ts(session["finalized_at"]) if session["finalized_at"] else None
         if session["status"] != "finalized":
             finalized_at = now
             # 原子提交：status active -> finalized 即把该会话 declared_bytes
             # 从租户 reserved 聚合移到 used 聚合（均为按状态实时 SUM，无独立计数器），
-            # 预留额原子转为已用量，同一事务内无中间态
-            get_conn().execute(
-                "UPDATE sessions SET status = 'finalized', finalized_at = ? WHERE id = ?",
-                (finalized_at.isoformat(), session_id),
-            )
-            get_conn().commit()
-        # 已 finalized 时重复提交：幂等返回同一份清单
+            # 预留额原子转为已用量，同一事务内无中间态。异常回滚后会话仍为 active。
+            with locked_transaction() as write_conn:
+                write_conn.execute(
+                    "UPDATE sessions SET status = 'finalized', finalized_at = ? WHERE id = ?",
+                    (finalized_at.isoformat(), session_id),
+                )
+        # 已 finalized 时重复提交：幂等返回同一份清单（无写入，无事务）
 
     return FinalizeResponse(
         session_id=session_id,
@@ -1666,8 +1712,9 @@ def cancel_session(session_id: str):
         # 都必须立即失效，因此统一走取消清理。
         is_live = not reservation_expired(session, now)
         released_bytes = (session["declared_bytes"] or 0) if is_live else 0
-        _cancel_session_locked(session_id, now)
-        conn.commit()
+        # 取消清理为一笔事务：会话终态与全部租约/验收令牌清除一起提交或一起回滚
+        with locked_transaction():
+            _cancel_session_locked(session_id, now)
 
     return CancelSessionResponse(
         session_id=session_id,
@@ -1718,25 +1765,26 @@ def set_tenant_quota(tenant_id: str, req: SetTenantQuotaRequest):
         reserved = tenant_reserved_bytes(tenant_id, now_iso)
         floor = used + reserved
         if req.quota_bytes < floor:
-            return conflict(
+            conflict(
                 "quota_bytes cannot be less than used_bytes + reserved_bytes",
                 quota_bytes=req.quota_bytes,
                 used_bytes=used,
                 reserved_bytes=reserved,
                 minimum_quota_bytes=floor,
             )
-        if tenant is None:
-            conn.execute(
-                "INSERT INTO tenants (tenant_id, quota_bytes, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (tenant_id, req.quota_bytes, now_iso, now_iso),
-            )
-        else:
-            conn.execute(
-                "UPDATE tenants SET quota_bytes = ?, updated_at = ? WHERE tenant_id = ?",
-                (req.quota_bytes, now_iso, tenant_id),
-            )
-        conn.commit()
+        # UPSERT 单独成事务：409 在开事务之前抛出，不可能遗留半成品租户行
+        with locked_transaction() as write_conn:
+            if tenant is None:
+                write_conn.execute(
+                    "INSERT INTO tenants (tenant_id, quota_bytes, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (tenant_id, req.quota_bytes, now_iso, now_iso),
+                )
+            else:
+                write_conn.execute(
+                    "UPDATE tenants SET quota_bytes = ?, updated_at = ? WHERE tenant_id = ?",
+                    (req.quota_bytes, now_iso, tenant_id),
+                )
         tenant = conn.execute(
             "SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)
         ).fetchone()
@@ -1802,12 +1850,12 @@ def create_delivery_ticket(session_id: str, req: CreateDeliveryTicketRequest):
         token = secrets.token_urlsafe(32)
         token_hash = hash_ticket_token(token)
         expires_at = now + timedelta(seconds=req.expires_in_seconds)
-        get_conn().execute(
-            "INSERT INTO delivery_tickets (token_hash, session_id, expires_at, status)"
-            " VALUES (?, ?, ?, 'active')",
-            (token_hash, session_id, expires_at.isoformat()),
-        )
-        get_conn().commit()
+        with locked_transaction() as write_conn:
+            write_conn.execute(
+                "INSERT INTO delivery_tickets (token_hash, session_id, expires_at, status)"
+                " VALUES (?, ?, ?, 'active')",
+                (token_hash, session_id, expires_at.isoformat()),
+            )
 
     return DeliveryTicketResponse(
         ticket_token=token,
@@ -1888,23 +1936,25 @@ def redeem_delivery_ticket(req: RedeemDeliveryTicketRequest):
         )
         payload = result.model_dump(mode="json")
 
-        # 原子消费：仅 active 凭证可被置为 consumed；并发不同 request_id 至多一个命中
-        cur = conn.execute(
-            "UPDATE delivery_tickets SET status = 'consumed'"
-            " WHERE token_hash = ? AND status = 'active'",
-            (token_hash,),
-        )
-        if cur.rowcount != 1:
-            # 临界区内被并发请求抢先消费（理论上写锁串行化不会发生，防御性处理）
-            raise HTTPException(
-                status_code=409, detail="delivery ticket already consumed")
-        conn.execute(
-            "INSERT INTO delivery_ticket_redemptions"
-            " (token_hash, request_id, response_json, created_at)"
-            " VALUES (?, ?, ?, ?)",
-            (token_hash, req.request_id, json.dumps(payload), now.isoformat()),
-        )
-        conn.commit()
+        # 原子消费：仅 active 凭证可被置为 consumed；并发不同 request_id 至多一个命中。
+        # UPDATE 与幂等记录插入为一笔事务：任一失败整体回滚，不会出现凭证已消费但
+        # 幂等响应缺失（或反之）的半成品，连接也能继续服务后续请求
+        with locked_transaction() as write_conn:
+            cur = write_conn.execute(
+                "UPDATE delivery_tickets SET status = 'consumed'"
+                " WHERE token_hash = ? AND status = 'active'",
+                (token_hash,),
+            )
+            if cur.rowcount != 1:
+                # 临界区内被并发请求抢先消费（理论上写锁串行化不会发生，防御性处理）
+                raise HTTPException(
+                    status_code=409, detail="delivery ticket already consumed")
+            write_conn.execute(
+                "INSERT INTO delivery_ticket_redemptions"
+                " (token_hash, request_id, response_json, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (token_hash, req.request_id, json.dumps(payload), now.isoformat()),
+            )
 
     return result
 
@@ -1938,11 +1988,11 @@ def revoke_delivery_ticket(req: RevokeDeliveryTicketRequest):
 
         already_revoked = ticket["status"] == TICKET_STATUS_REVOKED
         if not already_revoked:
-            conn.execute(
-                "UPDATE delivery_tickets SET status = 'revoked' WHERE token_hash = ?",
-                (ticket["token_hash"],),
-            )
-            conn.commit()
+            with locked_transaction() as write_conn:
+                write_conn.execute(
+                    "UPDATE delivery_tickets SET status = 'revoked' WHERE token_hash = ?",
+                    (ticket["token_hash"],),
+                )
 
     return RevokeDeliveryTicketResponse(
         session_id=ticket["session_id"],
@@ -2197,17 +2247,18 @@ def lease_verification(req: Optional[VerificationLeaseRequest] = Body(default=No
         expires_at = now + timedelta(seconds=ttl)
         # UPSERT：同一分片至多一行当前验收租约；过期重领以新令牌/新到期时间原子换发。
         # 资格检查与写入在同一临界区，并发请求串行化后只有一个能领取任一分片。
-        conn.execute(
-            "INSERT INTO verification_leases"
-            " (token_hash, session_id, chunk_index, issued_at, expires_at)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(session_id, chunk_index) DO UPDATE SET"
-            " token_hash = excluded.token_hash, issued_at = excluded.issued_at,"
-            " expires_at = excluded.expires_at",
-            (token_hash, row["session_id"], row["chunk_index"],
-             now_iso, expires_at.isoformat()),
-        )
-        conn.commit()
+        # UPSERT 单独成事务：409 在其之前抛出（无写入），SQL 异常回滚不留半行
+        with locked_transaction() as write_conn:
+            write_conn.execute(
+                "INSERT INTO verification_leases"
+                " (token_hash, session_id, chunk_index, issued_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(session_id, chunk_index) DO UPDATE SET"
+                " token_hash = excluded.token_hash, issued_at = excluded.issued_at,"
+                " expires_at = excluded.expires_at",
+                (token_hash, row["session_id"], row["chunk_index"],
+                 now_iso, expires_at.isoformat()),
+            )
 
     return VerificationLeaseResponse(
         session_id=row["session_id"],
@@ -2268,7 +2319,7 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
                     status_code=409, detail="verification token mismatch")
             # 同枚令牌已有决定：同决定幂等返回首次结果，不同决定冲突
             if decision_row["decision"] != req.decision:
-                return conflict(
+                conflict(
                     "verification token already used with a conflicting decision",
                     original_decision=decision_row["decision"],
                 )
@@ -2305,37 +2356,40 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
 
         if req.decision == VERIFICATION_DECISION_APPROVE:
             new_status = "completed"
-            conn.execute(
+            chunk_update_sql = (
                 "UPDATE chunks SET status = 'completed'"
-                " WHERE session_id = ? AND chunk_index = ?",
-                (session_id, chunk_index),
+                " WHERE session_id = ? AND chunk_index = ?"
             )
+            chunk_update_args = (session_id, chunk_index)
             result_digest = chunk["chunk_digest"]
         else:
             # reject：原子清除摘要/完成时间并回到 pending；同时清除上传租约与退避冷却，
             # failure_count 保留，分片可立即被重新领取重传
             new_status = "pending"
-            conn.execute(
+            chunk_update_sql = (
                 "UPDATE chunks SET status = 'pending', chunk_digest = NULL,"
                 " completed_at = NULL, lease_token = NULL, lease_expires_at = NULL,"
                 " backoff_until = NULL"
-                " WHERE session_id = ? AND chunk_index = ?",
-                (session_id, chunk_index),
+                " WHERE session_id = ? AND chunk_index = ?"
             )
+            chunk_update_args = (session_id, chunk_index)
             result_digest = None
 
-        # 决定落库（token_hash 主键保证一枚令牌至多一个决定），随后删除当前验收租约
-        conn.execute(
-            "INSERT INTO verification_decisions"
-            " (token_hash, session_id, chunk_index, decision, decided_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (token_hash, session_id, chunk_index, req.decision, now.isoformat()),
-        )
-        conn.execute(
-            "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
-            (session_id, chunk_index),
-        )
-        conn.commit()
+        # 分片状态、决定记录、验收租约删除为一笔事务：中途异常整体回滚，
+        # 不会出现“决定已落库但分片仍待验收”等半成品
+        with locked_transaction() as write_conn:
+            write_conn.execute(chunk_update_sql, chunk_update_args)
+            # 决定落库（token_hash 主键保证一枚令牌至多一个决定），随后删除当前验收租约
+            write_conn.execute(
+                "INSERT INTO verification_decisions"
+                " (token_hash, session_id, chunk_index, decision, decided_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token_hash, session_id, chunk_index, req.decision, now.isoformat()),
+            )
+            write_conn.execute(
+                "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
+                (session_id, chunk_index),
+            )
 
     return VerificationDecideResponse(
         session_id=session_id,

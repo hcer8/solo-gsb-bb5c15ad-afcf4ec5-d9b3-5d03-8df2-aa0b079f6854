@@ -1,10 +1,18 @@
-"""SQLite 存储层：单连接 + 进程内写锁，启动时自动建库建表。"""
+"""SQLite 存储层：单连接 + 进程内写锁，启动时自动建库建表。
+
+连接以 autocommit 模式（isolation_level=None）创建：sqlite3 不再隐式开启事务，
+所有状态变更必须经 locked_transaction 显式 BEGIN IMMEDIATE…COMMIT/ROLLBACK。
+这样 4xx 校验失败或写入中途异常时，本次写入随事务回滚，不会遗留被后续请求意外
+提交的半成品事务。
+"""
 from __future__ import annotations
 
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 DB_PATH = os.environ.get("UPLOAD_DB_PATH", "./data/coordinator.db")
 
@@ -12,6 +20,90 @@ DB_PATH = os.environ.get("UPLOAD_DB_PATH", "./data/coordinator.db")
 DB_LOCK = threading.RLock()
 
 _conn: sqlite3.Connection | None = None
+
+# 故障注入钩子（仅供测试）：形如 (sql_substring, remaining_matches) 时，写事务内
+# 执行匹配该子串的第 (remaining+1) 条 SQL 会被中断并抛 OperationalError，模拟
+# “写入中途的数据库异常”。生产代码不设置该值；set_sql_fault 会把进程级连接替换为
+# _FaultableConnection 子类实例（方法在子类层重写，覆盖 sqlite3 C 类型的不可变限制），
+# 因此事务内经 get_conn() 直接执行的内部辅助 SQL（如取消清理）也能被精确命中。
+_fault: tuple[str, int] | None = None
+# 仅在 locked_transaction 期间为真：读路径（autocommit）上的同名 SQL 不会被故障命中
+_in_write_transaction = False
+
+
+class _FaultableConnection(sqlite3.Connection):
+    """支持故障注入的连接子类：execute/executemany 在写事务内命中断言子串时抛
+    OperationalError，其余行为与普通 sqlite3.Connection 完全一致。"""
+
+    def execute(self, sql, parameters=()):
+        if _in_write_transaction:
+            _maybe_fault(sql)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        if _in_write_transaction:
+            _maybe_fault(sql)
+        return super().executemany(sql, parameters)
+
+
+def _maybe_fault(sql: str) -> None:
+    global _fault
+    if _fault is not None and _fault[0] in sql:
+        match, remaining = _fault
+        if remaining > 0:
+            _fault = (match, remaining - 1)
+        else:
+            # 一次性故障：触发后自动解除，随后的重试请求不再受影响
+            _fault = None
+            raise sqlite3.OperationalError(
+                "injected fault for matching SQL in write transaction")
+
+
+def set_sql_fault(match: str | None, allow_matching: int = 0) -> None:
+    """测试辅助：设置/清除写事务内的 SQL 故障注入。
+
+    match 为 None 时清除；否则在写事务内执行包含该子串的第
+    (allow_matching+1) 条 SQL 时抛 sqlite3.OperationalError（所在事务随即由
+    locked_transaction 回滚）。设置时把共享连接升级为支持故障注入的子类实例，
+    连接状态（库文件/WAL/PRAGMA）保持不变。
+    """
+    global _conn, _fault
+    _fault = None if match is None else (match, allow_matching)
+    if match is not None and _conn is not None and not isinstance(
+            _conn, _FaultableConnection):
+        _conn = sqlite3.connect(
+            DB_PATH, check_same_thread=False, isolation_level=None,
+            factory=_FaultableConnection)
+        _conn.row_factory = sqlite3.Row
+        # foreign_keys 是连接级设置（不持久于库文件），重连后必须重新打开；
+        # journal_mode=WAL 记录在数据库头中，重连后保持不变
+        _conn.execute("PRAGMA foreign_keys=ON")
+        _conn.execute("PRAGMA busy_timeout=5000")
+
+
+@contextmanager
+def locked_transaction() -> Iterator[sqlite3.Connection]:
+    """调用方必须已持有 DB_LOCK：在共享连接上开一笔显式写事务。
+
+    连接以 autocommit 模式（isolation_level=None）运行，任何状态变更的提交点都只
+    能由本上下文显式给出：正常退出时 COMMIT；以任意异常（含 4xx HTTPException 与
+    sqlite3 数据库异常）退出时 ROLLBACK，保证本次写入绝不会遗留成开着的事务而被后续
+    无关请求意外提交。ROLLBACK 同时把出错的连接恢复到干净可用状态。
+    """
+    global _in_write_transaction
+    conn = get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    _in_write_transaction = True
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+    finally:
+        _in_write_transaction = False
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -351,18 +443,23 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
 
 def get_conn() -> sqlite3.Connection:
-    """返回进程级共享连接（惰性创建，首次调用时建库建表）。"""
+    """返回进程级共享连接（惰性创建，首次调用时建库建表）。
+
+    isolation_level=None 即 SQLite autocommit 模式：Python sqlite3 不再在首条 DML
+    时隐式开事务，所有写事务都必须经 locked_transaction 显式
+    BEGIN...COMMIT/ROLLBACK，避免 4xx 或数据库异常后遗留的隐式事务被后续请求提交。
+    """
     global _conn
     if _conn is None:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _conn = sqlite3.connect(
+            DB_PATH, check_same_thread=False, isolation_level=None)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.execute("PRAGMA busy_timeout=5000")
         with DB_LOCK:
             _conn.executescript(SCHEMA)
-            _conn.commit()
         run_migrations(_conn)  # 补齐旧库缺失的列
     return _conn
 
