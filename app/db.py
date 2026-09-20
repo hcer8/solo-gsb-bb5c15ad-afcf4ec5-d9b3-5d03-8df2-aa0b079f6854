@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Optional
 
 DB_PATH = os.environ.get("UPLOAD_DB_PATH", "./data/coordinator.db")
 
@@ -12,6 +14,38 @@ DB_PATH = os.environ.get("UPLOAD_DB_PATH", "./data/coordinator.db")
 DB_LOCK = threading.RLock()
 
 _conn: sqlite3.Connection | None = None
+
+# 测试专用故障注入点：生产恒为 None。测试可 monkeypatch 为签名
+# (conn, label) -> None 的回调；write_transaction 在提交前调用它，回调抛出的
+# 异常与真实数据库异常走完全相同的回滚路径，用以验证失败原子性（见测试）。
+_before_commit_hook: Optional[Callable[[sqlite3.Connection, str], None]] = None
+
+
+@contextmanager
+def write_transaction(label: str = "write"):
+    """所有状态变更的统一事务边界。
+
+    进入即取得进程内写锁与共享连接，临界区内的全部读写构成一个 SQLite 事务：
+    正常离开时提交；任何异常（含 4xx 控制流异常与数据库执行异常）一律先回滚
+    再抛出。由此保证：
+    - 校验失败/执行异常的本次写入全部撤销，不会有半成品遗留在共享连接上；
+    - 失败请求未提交的内容不可能被后续请求的 commit 意外带入；
+    - 异常回滚后连接立即恢复可用，下一个请求正常开启新事务。
+
+    label 仅用于测试故障注入定位（如 "complete_chunk"），生产无副作用。
+    预留到期的惰性取消不走本边界提交——它在 expire_session_if_due 内独立
+    commit，因此即使主事务最终回滚或返回 4xx，取消也已完整持久化。
+    """
+    with DB_LOCK:
+        conn = get_conn()
+        try:
+            yield conn
+            if _before_commit_hook is not None:
+                _before_commit_hook(conn, label)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (

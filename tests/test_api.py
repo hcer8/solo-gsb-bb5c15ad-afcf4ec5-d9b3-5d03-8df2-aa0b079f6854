@@ -3861,3 +3861,433 @@ def test_migration_adds_tenant_tables_and_columns_to_legacy_database(tmp_path):
     ).fetchone()[0] == 200
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 统一事务边界与故障注入
+#
+# 验证：写接口在返回 4xx 或数据库异常时不会遗留 SQLite 事务；
+# - 普通校验失败/执行异常回滚本次写入，半成品不会被后续请求意外提交；
+# - 预留到期触发的惰性取消即使最终返回 409，也独立完整持久化（立即清除
+#   上传租约与验收租约）；
+# - 失败后共享连接可继续使用，账务、分片、游标均无半成品。
+
+import sqlite3  # noqa: E402
+
+import app.db as db_module  # noqa: E402
+
+
+# 故障注入下服务端返回 500，需要不抛出异常的客户端
+fault_client = TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def fault_before_commit():
+    """让匹配 label 的 write_transaction 在提交前抛出 sqlite3.OperationalError，
+    模拟数据库执行异常。arm(label, times=N) 后下 N 次匹配提交均失败；
+    回调在触发 N 次后自动停发（不卸载，保证重新 arm 仍生效），测试结束统一卸载。"""
+    state = {"label": None, "remaining": 0, "calls": 0}
+
+    def hook(conn, label):
+        if state["label"] is not None and label == state["label"] and state["remaining"] > 0:
+            state["remaining"] -= 1
+            state["calls"] += 1
+            raise sqlite3.OperationalError("injected failure before commit")
+
+    db_module._before_commit_hook = hook
+
+    def arm(label, times=1):
+        state["label"] = label
+        state["remaining"] = times
+        state["calls"] = 0
+
+    yield arm
+    db_module._before_commit_hook = None  # 测试失败时也保证卸载
+    assert state["remaining"] == 0, "armed fault injection never fired"
+
+
+def _connection_is_clean():
+    """共享连接上不存在未提交事务（失败回滚后必须为 False）。"""
+    return get_conn().in_transaction
+
+
+def test_4xx_validation_failures_leave_no_open_transaction():
+    s = make_session(total_chunks=2)
+    # 一系列返回 4xx 的写请求：均不得在共享连接上遗留打开的事务
+    assert lease(s["id"], 0).status_code == 200  # 先占一个有效租约
+    assert lease(s["id"], 0).status_code == 409  # 重复领取
+    assert complete(s["id"], 1, "wrong-token", "a" * 64).status_code == 409
+    assert fail(s["id"], 1, "wrong-token").status_code == 409
+    assert reopen(s["id"], 1, "t", "d").status_code == 409
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 409
+    assert fork(s["id"], 0, "tx-fork", [0]).status_code == 409  # 0 未完成
+    assert _connection_is_clean() is False
+
+    # 紧随其后的成功写入不得把前面任何失败请求的半成品带入：
+    # 分片 1 仍可正常领取，状态干净
+    r = lease(s["id"], 1)
+    assert r.status_code == 200
+    assert _connection_is_clean() is False
+    st = client.get(f"/sessions/{s['id']}").json()
+    by_idx = {c["chunk_index"]: c for c in st["chunks"]}
+    assert by_idx[0]["status"] == "leased"
+    assert by_idx[1]["status"] == "leased"
+    assert by_idx[1]["failure_count"] == 0
+    assert by_idx[1]["chunk_digest"] is None
+
+
+def test_quota_409_rolls_back_and_does_not_leak_into_next_request():
+    tid = "tenant-tx-quota-409"
+    set_quota(tid, 1000)
+    s = make_session(total_chunks=1, tenant_id=tid, declared_bytes=600)
+    # 超额创建返回 409：事务回滚，无残留
+    r = client.post("/sessions", json={
+        "total_chunks": 1, "file_digest": "f" * 64,
+        "tenant_id": tid, "declared_bytes": 500})
+    assert r.status_code == 409
+    assert _connection_is_clean() is False
+    view = quota_view(tid).json()
+    assert view["reserved_bytes"] == 600
+    # 下一个请求（降配额到下限以下也返回 409）不会把上面失败的会话提交出来
+    assert set_quota(tid, 599).status_code == 409
+    assert quota_view(tid).json()["reserved_bytes"] == 600
+    # 连接仍可继续服务成功请求
+    assert cancel(s["id"]).status_code == 200
+    assert quota_view(tid).json()["reserved_bytes"] == 0
+
+
+def test_lazy_cancel_on_expired_reservation_persists_even_when_response_is_409():
+    tid = "tenant-tx-lazy-cancel"
+    set_quota(tid, 1000)
+    s = make_session(total_chunks=2, tenant_id=tid, declared_bytes=600)
+    token0 = lease(s["id"], 0).json()["lease_token"]
+    expire_reservation(s["id"])
+
+    # complete 路径：惰性取消已发生（独立事务），随后令牌校验返回 409
+    r = complete(s["id"], 0, token0, "0" * 64)
+    assert r.status_code == 409
+
+    # 关键：取消必须已经独立持久化，不依赖任何后续请求的 commit
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "cancelled"
+    assert st["cancelled_at"] is not None
+    # 在途上传租约已随取消立即清除
+    assert st["chunks"][0]["status"] == "pending"
+    assert st["chunks"][0]["lease_expires_at"] is None
+    assert _connection_is_clean() is False
+
+    # 容量预留已释放，且后续任何写请求不会重新“补提”取消或产生半成品
+    view = quota_view(tid).json()
+    assert view["reserved_bytes"] == 0
+    assert lease(s["id"], 1).status_code == 409
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 409
+    assert reopen(s["id"], 0, token0, "0" * 64).status_code == 409
+    st2 = client.get(f"/sessions/{s['id']}").json()
+    assert st2["status"] == "cancelled"
+    assert st2["chunks"][1]["status"] == "pending"
+    # 已释放容量可被新会话重新使用，证明连接状态正常
+    other = make_session(total_chunks=1, tenant_id=tid, declared_bytes=1000)
+    assert quota_view(tid).json()["reserved_bytes"] == 1000
+    cancel(other["id"])
+
+
+def test_lazy_cancel_clears_verification_lease_before_returning_409():
+    s = make_verification_session(total_chunks=1)
+    lease_complete_awaiting(s["id"], 0)
+    grant = verification_lease().json()
+    # 此时待验收分片持有未过期验收令牌
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_leases WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 1
+    expire_reservation(s["id"])
+
+    # decide 路径：惰性取消先独立提交（验收租约行删除、分片回 pending），随后 409
+    r = decide(s["id"], 0, grant["verification_token"], "approve")
+    assert r.status_code == 409
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "cancelled"
+    assert st["chunks"][0]["status"] == "pending"
+    assert st["chunks"][0]["chunk_digest"] is None
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_leases WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 0
+    # 旧验收令牌即使重放也无法落任何决定
+    assert decide(s["id"], 0, grant["verification_token"], "approve").status_code == 409
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_decisions WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 0
+    assert _connection_is_clean() is False
+
+
+def test_lazy_cancel_in_dispatch_is_committed_without_cursor_or_grant():
+    tid = "tenant-tx-dispatch-expire"
+    set_quota(tid, 10_000)
+    expired = make_session(total_chunks=1, tenant_id=tid, declared_bytes=100)["id"]
+    lease(expired, 0)
+    expire_reservation(expired)
+
+    r = client.post("/dispatch/lease", json={
+        "queue_key": "q-tx-expire", "session_ids": [expired]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["granted"] is None
+    assert body["unavailable"][0]["reason"] == "reservation_expired"
+    # 取消已持久化；未发放租约，游标不得建立
+    assert client.get(f"/sessions/{expired}").json()["status"] == "cancelled"
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM dispatch_cursors WHERE queue_key = ?",
+        ("q-tx-expire",)).fetchone()["n"] == 0
+    st = client.get(f"/sessions/{expired}").json()
+    assert st["chunks"][0]["status"] == "pending"
+    # 再来一次：按已取消报告，不会重复触发、不发放
+    r2 = client.post("/dispatch/lease", json={
+        "queue_key": "q-tx-expire", "session_ids": [expired]})
+    assert r2.json()["unavailable"][0]["reason"] == "session_cancelled"
+    assert r2.json()["granted"] is None
+
+
+def test_injected_db_error_on_create_session_rolls_back_everything(fault_before_commit):
+    tid = "tenant-tx-fault-create"
+    set_quota(tid, 10_000)
+    before = get_conn().execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
+    fault_before_commit("create_session")
+    r = fault_client.post("/sessions", json={
+        "total_chunks": 2, "file_digest": "f" * 64,
+        "tenant_id": tid, "declared_bytes": 500})
+    assert r.status_code == 500
+    # 连接已被回滚并立即可用：无残留事务
+    assert _connection_is_clean() is False
+    # 无半成品：会话、分片均未出现，账务预留未增加
+    assert get_conn().execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"] == before
+    view = quota_view(tid).json()
+    assert view["reserved_bytes"] == 0
+    # 下一个请求正常成功
+    ok = make_session(total_chunks=2, tenant_id=tid, declared_bytes=500)
+    assert quota_view(tid).json()["reserved_bytes"] == 500
+    assert client.get(f"/sessions/{ok['id']}").status_code == 200
+    cancel(ok["id"])
+
+
+def test_injected_db_error_on_single_lease_rolls_back_lease(fault_before_commit):
+    s = make_session(total_chunks=1)
+    fault_before_commit("claim_lease")
+    r = fault_client.post(f"/sessions/{s['id']}/chunks/0/lease", json={})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 半成品租约未落库：分片仍 pending、无令牌
+    row = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = 0", (s["id"],)
+    ).fetchone()
+    assert row["status"] == "pending" and row["lease_token"] is None
+    # 连接继续可用：重新领取成功
+    again = lease(s["id"], 0)
+    assert again.status_code == 200
+    assert client.get(f"/sessions/{s['id']}").json()["active_leases"] == 1
+
+
+def test_injected_db_error_on_batch_lease_is_atomic(fault_before_commit):
+    s = make_capped_session(total_chunks=4, max_active_leases=4)
+    fault_before_commit("claim_leases_batch")
+    r = fault_client.post(f"/sessions/{s['id']}/leases/batch", json={"count": 4})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 整批回滚：没有任何分片变成 leased
+    states = [c["status"] for c in client.get(f"/sessions/{s['id']}").json()["chunks"]]
+    assert states == ["pending"] * 4
+    # 后续批量领取恢复正常，一次拿到全部 4 个
+    body = batch_lease(s["id"], 4).json()
+    assert len(body["granted"]) == 4
+    assert [g["chunk_index"] for g in body["granted"]] == [0, 1, 2, 3]
+
+
+def test_injected_db_error_on_dispatch_keeps_cursor_and_chunks_intact(fault_before_commit):
+    a = make_session(total_chunks=1)["id"]
+    fault_before_commit("dispatch_lease")
+    r = fault_client.post("/dispatch/lease", json={
+        "queue_key": "q-tx-fault-dispatch", "session_ids": [a]})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 游标半成品与分片租约均未持久化
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM dispatch_cursors WHERE queue_key = ?",
+        ("q-tx-fault-dispatch",)).fetchone()["n"] == 0
+    assert client.get(f"/sessions/{a}").json()["chunks"][0]["status"] == "pending"
+    # 重试成功，游标正常建立在 a
+    ok = dispatch("q-tx-fault-dispatch", [a])
+    assert ok.status_code == 200
+    assert ok.json()["granted"]["session_id"] == a
+    assert ok.json()["cursor_session_id"] == a
+
+
+def test_injected_db_error_on_complete_rolls_back_status_change(fault_before_commit):
+    s = make_session(total_chunks=1)
+    token = lease(s["id"], 0).json()["lease_token"]
+    fault_before_commit("complete_chunk")
+    r = fault_client.post(
+        f"/sessions/{s['id']}/chunks/0/complete",
+        json={"lease_token": token, "chunk_digest": "0" * 64})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    row = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = 0", (s["id"],)
+    ).fetchone()
+    assert row["status"] == "leased"
+    assert row["chunk_digest"] is None and row["completed_at"] is None
+    # 原租约仍有效，连接可继续服务：重报成功
+    assert complete(s["id"], 0, token, "0" * 64).status_code == 200
+
+
+def test_injected_db_error_on_fail_rolls_back_counter_and_lease_clear(fault_before_commit):
+    s = make_session(total_chunks=1)
+    token = lease(s["id"], 0).json()["lease_token"]
+    fault_before_commit("fail_chunk")
+    r = fault_client.post(
+        f"/sessions/{s['id']}/chunks/0/fail", json={"lease_token": token})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    row = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? AND chunk_index = 0", (s["id"],)
+    ).fetchone()
+    # 半成品全部回滚：仍是 leased、失败次数未增、无冷却、令牌保留
+    assert row["status"] == "leased"
+    assert row["lease_token"] == token
+    assert (row["failure_count"] or 0) == 0 and row["backoff_until"] is None
+    # 连接恢复后同一令牌可正常上报失败
+    body = fail(s["id"], 0, token)
+    assert body.status_code == 200 and body.json()["failure_count"] == 1
+
+
+def test_injected_db_error_on_reopen_rolls_back_reset_and_revision(fault_before_commit):
+    s = make_session_with_deps(2, {1: [0]})
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    lease_complete(s["id"], 1, "1" * 64)
+    fault_before_commit("reopen_chunk")
+    r = fault_client.post(
+        f"/sessions/{s['id']}/chunks/0/reopen",
+        json={"lease_token": t0, "expected_digest": d0})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["revision"] == 0
+    assert [c["status"] for c in st["chunks"]] == ["completed", "completed"]
+    # 恢复后重新回退成功
+    assert reopen(s["id"], 0, t0, d0).status_code == 200
+    assert client.get(f"/sessions/{s['id']}").json()["revision"] == 1
+
+
+def test_injected_db_error_on_finalize_preserves_reserved_accounting(fault_before_commit):
+    tid = "tenant-tx-fault-finalize"
+    set_quota(tid, 10_000)
+    s = make_session(total_chunks=1, tenant_id=tid, declared_bytes=300)
+    token = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, token, "0" * 64)
+    fault_before_commit("finalize_session")
+    r = fault_client.post(f"/sessions/{s['id']}/finalize")
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 会话仍 active：预留未转已用量，账务无半成品
+    assert client.get(f"/sessions/{s['id']}").json()["status"] == "active"
+    view = quota_view(tid).json()
+    assert view["used_bytes"] == 0 and view["reserved_bytes"] == 300
+    # 恢复后正常提交，原子转量
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+    view2 = quota_view(tid).json()
+    assert view2["used_bytes"] == 300 and view2["reserved_bytes"] == 0
+
+
+def test_injected_db_error_on_fork_persists_no_session_or_request(fault_before_commit):
+    tid = "tenant-tx-fault-fork"
+    set_quota(tid, 10_000)
+    s = make_session(total_chunks=1, tenant_id=tid, declared_bytes=300)
+    t0, _ = lease_complete(s["id"], 0, "0" * 64)
+    fault_before_commit("fork_session")
+    r = fault_client.post(f"/sessions/{s['id']}/fork", json={
+        "expected_revision": 0, "request_id": "fault-fork", "reuse_chunks": [0]})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 新会话、依赖/分片复制、幂等记录与第二次预留全部回滚
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE source_session_id = ?",
+        (s["id"],)).fetchone()["n"] == 0
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM fork_requests WHERE request_id = 'fault-fork'"
+    ).fetchone()["n"] == 0
+    assert quota_view(tid).json()["reserved_bytes"] == 300
+    # 恢复后同一 request_id 可正常首次创建（未被半成品幂等记录占用）
+    ok = fork(s["id"], 0, "fault-fork", [0])
+    assert ok.status_code == 201
+
+
+def test_injected_db_error_on_cancel_keeps_reservation_and_leases(fault_before_commit):
+    tid = "tenant-tx-fault-cancel"
+    set_quota(tid, 10_000)
+    s = make_session(total_chunks=1, tenant_id=tid, declared_bytes=400)
+    lease(s["id"], 0)
+    fault_before_commit("cancel_session")
+    r = fault_client.post(f"/sessions/{s['id']}/cancel")
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "active"
+    assert st["chunks"][0]["status"] == "leased"
+    assert quota_view(tid).json()["reserved_bytes"] == 400
+    # 恢复后取消成功并真实释放
+    body = cancel(s["id"])
+    assert body.status_code == 200 and body.json()["released_bytes"] == 400
+    assert quota_view(tid).json()["reserved_bytes"] == 0
+
+
+def test_injected_db_error_on_ticket_lifecycle_is_atomic(fault_before_commit):
+    sid, _ = finalized_session(1)
+    tickets_before = get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_tickets").fetchone()["n"]
+    # 签发失败：凭证行不出现
+    fault_before_commit("create_delivery_ticket")
+    r = fault_client.post(
+        f"/sessions/{sid}/delivery-tickets", json={"expires_in_seconds": 600})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_tickets").fetchone()["n"] == tickets_before
+
+    token = issue_ticket(sid, 600).json()["ticket_token"]
+    # 兑换失败：凭证仍 active、幂等记录不出现、仍可被其它 request_id 兑换
+    fault_before_commit("redeem_delivery_ticket")
+    r = fault_client.post("/delivery-tickets/redeem",
+                          json={"token": token, "request_id": "fault-redeem"})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    row = get_conn().execute(
+        "SELECT status FROM delivery_tickets WHERE token_hash = ?", (token_hash,)
+    ).fetchone()
+    assert row["status"] == "active"
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM delivery_ticket_redemptions"
+        " WHERE request_id = 'fault-redeem'").fetchone()["n"] == 0
+    # 恢复后兑换成功（一次性语义未被故障破坏）
+    assert redeem(token, "ok-redeem").status_code == 200
+    assert redeem(token, "other-redeem").status_code == 409
+
+
+def test_injected_db_error_on_verification_decide_is_atomic(fault_before_commit):
+    s = make_verification_session(total_chunks=1)
+    lease_complete_awaiting(s["id"], 0)
+    g = verification_lease().json()
+    fault_before_commit("decide_verification")
+    r = fault_client.post(
+        f"/verifications/{s['id']}/0/decide",
+        json={"verification_token": g["verification_token"], "decision": "approve"})
+    assert r.status_code == 500
+    assert _connection_is_clean() is False
+    # 分片仍待验收、验收租约仍在、决定记录未落
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][0]["status"] == "awaiting_verification"
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_leases WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 1
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_decisions WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 0
+    # 恢复后同一令牌仍可正常决定
+    assert decide(s["id"], 0, g["verification_token"], "approve").status_code == 200
